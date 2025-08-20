@@ -1,0 +1,20 @@
+# macOS
+.DS_Store
+
+# Arduino build output
+*.bin
+*.elf
+*.map
+
+# Arduino IDE cache
+*.partitions.bin
+*.bootloader.bin
+*.merged.bin
+
+# Backup files
+*.swp
+*.bak
+*.tmp
+
+#build Dateien
+/build
