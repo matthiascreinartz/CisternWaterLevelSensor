@@ -9,40 +9,22 @@
  * Features:
  *   - WLAN-Anbindung (SSID & Passwort seriell konfigurierbar, im Flash gespeichert)
  *   - MQTT-Client mit optionalem Benutzername/Passwort (Last Will & Testament: "offline")
- *   - JSON-Log mit Zeitstempel, Prozent- und Absolutwert
- *   - OTA Update über Webinterface
+ *   - JSON-Log mit Zeitstempel, Prozent- und Absolutwert sowie Trend
+ *   - OTA-Update über Webinterface
  *   - Täglicher Reboot als Failsafe
  *   - Error-Logging auf MQTT-Topic "wasserstand/lastError"
  *
  * Wichtige Topics:
- *   - wasserstand/prozent   → Füllstand in %
- *   - wasserstand/log       → JSON mit timestamp, prozent, absolut, trend
- *   - wasserstand/status    → online/offline (Last Will)
- *   - wasserstand/lastError → letzte Fehlermeldung (inkl. Reset-Grund, OTA usw.)
+ *   - wasserstand/prozent
+ *   - wasserstand/absolut
+ *   - wasserstand/log
+ *   - wasserstand/status
+ *   - wasserstand/lastError
  *
- * Developer Notes:
- *   - WiFi & MQTT Reconnect sind non-blocking (damit OTA/Webserver auch bei
- *     Verbindungsproblemen immer erreichbar bleiben).
- *   - Konfiguration (SSID, Passwort, MQTT Host/User/Pass) wird über Serial eingegeben
- *     und im Flash (Preferences) gespeichert.
- *   - Messungen laufen nur, wenn MQTT verbunden ist – andernfalls wird ein Error geloggt.
- *
- * Hardware:
- *   - ESP32 NodeMCU Development Board
- *   - JSN-SR04T-2.0 Wasserfester Ultraschallsensor
- *
- * Weitere Info:
- *   - Die gewonnen Daten verarbeite ich auf meinem RaspberryPi weiter:
- *     - Jede neue JSON Message wird in einer monatlich generierten CSV geloggt
- *     - Auf dem RasperryPi läuft Homebridge mit dem Plugin MQTTTHing. So habe ich dann die
- *       Daten in Apple HomeKit eingebunden und dort als Thermostat dargestellt.
- *
- * Autor: Matthiass Reinartz
+ * Autor: Matthias Reinartz
  * Git:   https://gitlab.com/matthiascreinartz/CisternWaterLevelSensor
  * ---------------------------------------------------------------------------
  */
-
-
 
 #include <WiFi.h>
 #include <PubSubClient.h>
@@ -53,65 +35,76 @@
 #include <Preferences.h>
 #include <esp_system.h>
 
+// ---------------------------------------------------------------------------
+// Globale Variablen und Konstanten
+// ---------------------------------------------------------------------------
+
 // ---- WLAN ----
 String wifiSsid;
-String wifiPass;
+String wifiPassword;
 
 // ---- MQTT ----
-WiFiClient espClient;
-PubSubClient mqttClient(espClient);
+WiFiClient wifiClient;
+PubSubClient mqttClient(wifiClient);
 String mqttHost;
-String mqttUser;
-String mqttPass;
+String mqttUsername;
+String mqttPassword;
 
 // ---- Messparameter ----
-constexpr float DIST_LEER_MM = 1390.0;
-constexpr float DIST_VOLL_MM = 240.0;
-constexpr float ULTRASONIC_US_TO_MM = 0.16868; // Umrechnungsfaktor für Schallgeschwindigkeit bei 10°C Lufttemperatur
+constexpr float DIST_EMPTY_MM   = 1390.0;   // Sensorabstand bei leerer Zisterne
+constexpr float DIST_FULL_MM    = 240.0;    // Sensorabstand bei voller Zisterne
+constexpr float US_TO_MM_FACTOR = 0.16868;  // Faktor für Umrechnung Schallgeschwindigkeit
 
-// ---- Flags -----
-constexpr unsigned long MEASUREMENT_INTERVAL_MS = 60000;      // jede Minute prüfen
-constexpr unsigned long SEND_INTERVAL_MS        = 3600000;    // spätestens alle 1h senden
-constexpr unsigned long MIN_CHANGE_MM           = 5;          // mind. 5mm Unterschied senden
+// ---- Intervalle und Schwellwerte ----
+constexpr unsigned long MEASUREMENT_INTERVAL_MS = 60000;    // jede Minute messen
+constexpr unsigned long SEND_INTERVAL_MS        = 3600000;  // spätestens alle 1h senden
+constexpr unsigned long MIN_CHANGE_MM           = 5;        // mindestens 5mm Änderung für Senden
 
 // ---- Trend-Erkennung ----
-constexpr int HISTORY_SIZE = 60;  // letzte 60 Minuten speichern
-float history[HISTORY_SIZE];
-unsigned long historyTime[HISTORY_SIZE];  // Timestamps der Messungen (ms)
+constexpr int HISTORY_SIZE = 60;  // letzte 60 Werte (ca. 1h)
+float historyValues[HISTORY_SIZE];
+unsigned long historyTimestamps[HISTORY_SIZE];
 int historyIndex = 0;
 int historyCount = 0;
 
 // ---- OTA ----
-WebServer server(80);
+WebServer otaServer(80);
+bool otaInProgress = false;
 
-// ---- Ultraschall ----
+// ---- Ultraschallsensor ----
 #define TRIG_PIN 5
 #define ECHO_PIN 18
 NewPing sonar(TRIG_PIN, ECHO_PIN, 200);
 
 // ---- Zeitserver ----
-const char* NTP_SERVER = "pool.ntp.org";
-const long GMT_OFFSET_SEC = 3600;
-const int DAYLIGHT_OFFSET_SEC = 3600;
+const char* NTP_SERVER          = "pool.ntp.org";
+const long GMT_OFFSET_SEC       = 3600;
+const int DAYLIGHT_OFFSET_SEC   = 3600;
 
-// ---- Variablen ----
+// ---- Laufzeitvariablen ----
 unsigned long lastMeasurementTime = 0;
 unsigned long lastSendTime        = 0;
-float lastMeasuredMM              = 0;
+float lastSentDistanceMM          = 0;
 String lastSentTrend              = "";
-bool otaInProgress                = false;
 bool rebootDoneToday              = false;
-unsigned long lastMQTTAttempt     = 0;
-Preferences prefs;
+unsigned long lastMQTTReconnect   = 0;
 
-// ---------- Hilfsfunktionen ----------
+Preferences preferences;
+
+// ---------------------------------------------------------------------------
+// Hilfsfunktionen
+// ---------------------------------------------------------------------------
+
+/**
+ * Liest eine Eingabezeile von der seriellen Schnittstelle ein.
+ */
 String readSerialLine() {
-  String input = "";
+  String input;
   while (true) {
     if (Serial.available()) {
       char c = Serial.read();
       if (c == '\n' || c == '\r') {
-        if (input.length() > 0) break; // Eingabe abgeschlossen
+        if (input.length() > 0) break;
       } else {
         input += c;
       }
@@ -121,21 +114,26 @@ String readSerialLine() {
   return input;
 }
 
+/**
+ * Fügt einen Wert in die Verlaufsliste für Trenderkennung ein.
+ */
 void addToHistory(float value) {
-  history[historyIndex] = value;
-  historyTime[historyIndex] = millis();
+  historyValues[historyIndex] = value;
+  historyTimestamps[historyIndex] = millis();
   historyIndex = (historyIndex + 1) % HISTORY_SIZE;
   if (historyCount < HISTORY_SIZE) historyCount++;
 }
 
-float calcTrend() {
-  // einfache lineare Regression: Steigung (mm/min)
-  if (historyCount < 5) return 0;  // zu wenig Daten
+/**
+ * Berechnet den Trend mittels linearer Regression (Steigung mm/min).
+ */
+float calculateTrendSlope() {
+  if (historyCount < 5) return 0; // zu wenig Daten
 
   double sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
   for (int i = 0; i < historyCount; i++) {
-    double x = (historyTime[i] - historyTime[0]) / 60000.0;  // Minuten
-    double y = history[i];
+    double x = (historyTimestamps[i] - historyTimestamps[0]) / 60000.0; // Minuten
+    double y = historyValues[i];
     sumX  += x;
     sumY  += y;
     sumXY += x * y;
@@ -145,18 +143,22 @@ float calcTrend() {
   double denom = historyCount * sumXX - sumX * sumX;
   if (denom == 0) return 0;
 
-  double slope = (historyCount * sumXY - sumX * sumY) / denom;
-  return slope;  // mm pro Minute
+  return (historyCount * sumXY - sumX * sumY) / denom;
 }
 
-String detectTrend() {
-  float slope = calcTrend();
-
-  if (slope < -0.1) return "einlaufend";   // Wasserstand steigt
-  if (slope > 0.1)  return "abnehmend";    // Wasserstand sinkt
-  return "stabil";                         // kaum Änderung
+/**
+ * Liefert Trend als String ("einlaufend", "abnehmend", "stabil").
+ */
+String getTrendLabel() {
+  float slope = calculateTrendSlope();
+  if (slope < -0.1) return "einlaufend";
+  if (slope > 0.1)  return "abnehmend";
+  return "stabil";
 }
 
+/**
+ * Gibt aktuellen Zeitstempel zurück.
+ */
 String getTimestamp() {
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo)) return "1970-01-01T00:00:00";
@@ -165,44 +167,54 @@ String getTimestamp() {
   return String(buffer);
 }
 
+/**
+ * Entfernt Zeitstempel aus einer Fehlermeldung.
+ */
 String stripTimestamp(const String &msg) {
   int pos = msg.indexOf(" -- ");
-  if (pos >= 0) {
-    return msg.substring(pos + 4); // alles nach " -- "
-  }
-  return msg;
+  return (pos >= 0) ? msg.substring(pos + 4) : msg;
 }
 
+/**
+ * Stellt sicher, dass WLAN verbunden ist.
+ */
+void ensureWifiConnected() {
+  if (WiFi.status() != WL_CONNECTED) {
+    WiFi.begin(wifiSsid, wifiPassword);
+    while (WiFi.status() != WL_CONNECTED) {
+      delay(300);
+      Serial.print(".");
+    }
+    Serial.printf("\nWLAN verbunden: %s\n", WiFi.localIP().toString().c_str());
+  }
+}
+
+/**
+ * Baut MQTT-Verbindung auf (synchron, blockierend).
+ */
 void connectMQTT() {
   mqttClient.setServer(mqttHost.c_str(), 1883);
 
   while (!mqttClient.connected()) {
     Serial.print("Verbinde MQTT...");
+    bool connected = false;
 
-    bool connected;
-
-    if (mqttUser != "" && mqttPass != "") {
+    if (!mqttUsername.isEmpty() && !mqttPassword.isEmpty()) {
       connected = mqttClient.connect(
-        "CisternSensor",                      // ClientID
-        mqttUser.c_str(), mqttPass.c_str(),   // User/Pass
-        "wasserstand/status",                 // LWT Topic
-        0,                                    // QoS
-        true,                                 // Retained
-        "offline"                             // LWT Message
+        "CisternSensor",
+        mqttUsername.c_str(), mqttPassword.c_str(),
+        "wasserstand/status", 0, true, "offline"
       );
     } else {
       connected = mqttClient.connect(
         "CisternSensor",
-        "wasserstand/status",
-        0,
-        true,
-        "offline"
+        "wasserstand/status", 0, true, "offline"
       );
     }
 
     if (connected) {
       Serial.println("✅ verbunden");
-      mqttClient.publish("wasserstand/status", "online", true); // retained = true
+      mqttClient.publish("wasserstand/status", "online", true);
     } else {
       Serial.printf(" ❌ Fehler, rc=%d\n", mqttClient.state());
       delay(2000);
@@ -210,125 +222,106 @@ void connectMQTT() {
   }
 }
 
-void ensureMQTT() {
-   if (!mqttClient.connected()) {
-    if (millis() - lastMQTTAttempt > 10000) {
-      lastMQTTAttempt = millis();
-      Serial.println("🔌 Versuche MQTT-Reconnect...");
-      
-      bool connected;
-      if (mqttUser != "" && mqttPass != "") {
-        connected = mqttClient.connect(
-          "CisternSensor",
-          mqttUser.c_str(), mqttPass.c_str(),
-          "wasserstand/status", 0, true, "offline"
-        );
-      } else {
-        connected = mqttClient.connect(
-          "CisternSensor",
-          "wasserstand/status", 0, true, "offline"
-        );
-      }
-
-      if (connected) {
-        Serial.println("✅ MQTT verbunden");
-        mqttClient.publish("wasserstand/status", "online", true);
-      } else {
-        Serial.printf("❌ Fehler, rc=%d\n", mqttClient.state());
-      }
-    }
+/**
+ * Versucht MQTT-Verbindung aufrechtzuerhalten.
+ */
+void ensureMQTTConnected() {
+  if (!mqttClient.connected() && millis() - lastMQTTReconnect > 10000) {
+    lastMQTTReconnect = millis();
+    Serial.println("🔌 Versuche MQTT-Reconnect...");
+    connectMQTT();
   }
-
-  mqttClient.loop(); // trotzdem immer aufrufen!
+  mqttClient.loop();
 }
 
+/**
+ * Veröffentlicht Nachricht über MQTT.
+ */
 void publishMQTT(const char* topic, const String& payload, bool retained = true) {
   if (mqttClient.connected()) {
     mqttClient.publish(topic, payload.c_str(), retained);
   }
 }
 
+/**
+ * Fehler im Flash speichern und über MQTT publizieren.
+ */
 void logError(const String &err) {
   String payload = getTimestamp() + " -- " + err;
-  prefs.begin("errorlog", false);
-  prefs.putString("lastError", payload);
-  prefs.end();
+  preferences.begin("errorlog", false);
+  preferences.putString("lastError", payload);
+  preferences.end();
   publishMQTT("wasserstand/lastError", payload);
 }
 
+/**
+ * Letzten gespeicherten Fehler lesen.
+ */
 String readLastError() {
-  prefs.begin("errorlog", true);
-  String e = prefs.getString("lastError", "Kein Fehler gespeichert");
-  prefs.end();
-  return e;
+  preferences.begin("errorlog", true);
+  String err = preferences.getString("lastError", "Kein Fehler gespeichert");
+  preferences.end();
+  return err;
 }
 
-void ensureWifi() {
-  if (WiFi.status() != WL_CONNECTED) {
-    WiFi.begin(wifiSsid, wifiPass);
-    while (WiFi.status() != WL_CONNECTED) {
-    delay(300);
-    Serial.print(".");
-  }
-  Serial.printf("\nWLAN verbunden: %s\n", WiFi.localIP().toString().c_str());
-  }
-}
-
+/**
+ * Entscheidet, ob aktuelle Messung gesendet werden sollte.
+ */
 bool shouldSendMeasurement(float currentMM, const String& trend) {
-  bool timeExceeded = millis() - lastSendTime >= SEND_INTERVAL_MS;
-  bool changeExceeded = fabs(currentMM - lastMeasuredMM) >= MIN_CHANGE_MM;
-  bool trendChanged   = (trend != lastSentTrend);
-  return timeExceeded || changeExceeded || trendChanged;
+  bool intervalExceeded = millis() - lastSendTime >= SEND_INTERVAL_MS;
+  bool changeExceeded   = fabs(currentMM - lastSentDistanceMM) >= MIN_CHANGE_MM;
+  bool trendChanged     = (trend != lastSentTrend);
+  return intervalExceeded || changeExceeded || trendChanged;
 }
 
+/**
+ * Führt eine Messung aus und sendet Ergebnisse bei Bedarf.
+ */
 void performMeasurement(bool forceSend = false) {
-  // Messung durchführen und Entfernung berechnen.
-  // Es werden 5 Messungen durchgeführt, die beiden extreme verworfen und aus den drei verbleibenden der Durchschnitt geliefert.
   float duration = sonar.ping_median(5);
-  float dist_mm  = duration * ULTRASONIC_US_TO_MM;
+  float distanceMM = duration * US_TO_MM_FACTOR;
 
-  // Plausibilitätsprüfung
-  if (dist_mm <= 200 || dist_mm > 2000) {
-    logError("Sensorfehler: " + String(dist_mm) + " mm");
+  if (distanceMM <= 200 || distanceMM > 2000) {
+    logError("Sensorfehler: " + String(distanceMM) + " mm");
     return;
   }
 
-  float prozent = (DIST_LEER_MM - dist_mm) / (DIST_LEER_MM - DIST_VOLL_MM) * 100.0;
-  prozent = constrain(prozent, 0, 100);
+  float percentage = (DIST_EMPTY_MM - distanceMM) / (DIST_EMPTY_MM - DIST_FULL_MM) * 100.0;
+  percentage = constrain(percentage, 0, 100);
 
-  addToHistory(dist_mm); // History für Trenderkennung befüllen
+  addToHistory(distanceMM);
+  String trend = getTrendLabel();
 
-  String trend = detectTrend();
+  if (forceSend || shouldSendMeasurement(distanceMM, trend)) {
+    lastSentDistanceMM = distanceMM;
+    lastSendTime       = millis();
+    lastSentTrend      = trend;
 
-  if (forceSend || shouldSendMeasurement(dist_mm, trend)) {
-    lastMeasuredMM = dist_mm;
-    lastSendTime   = millis();
-    lastSentTrend  = trend; 
-
-    publishMQTT("wasserstand/prozent", String((int)prozent));
-    publishMQTT("wasserstand/absolut", String((int)round(dist_mm)));
+    publishMQTT("wasserstand/prozent", String((int)percentage));
+    publishMQTT("wasserstand/absolut", String((int)round(distanceMM)));
 
     String json = "{\"timestamp\":\"" + getTimestamp() +
-                  "\",\"prozent\":" + String(prozent, 1) +
-                  ",\"absolut\":" + String((int)round(dist_mm)) + 
+                  "\",\"prozent\":" + String(percentage, 1) +
+                  ",\"absolut\":" + String((int)round(distanceMM)) + 
                   ",\"trend\":\"" + trend + "\"}";
 
-    String state = "OFF"; // Default Off
+    String state = "OFF";
     if (trend == "einlaufend") {
-      state = "HEAT"; // Heat
+      state = "HEAT";
       publishMQTT("wasserstand/getTargetTemperature", "100");
     } else if (trend == "abnehmend") {
-      state = "COOL"; // Cool
+      state = "COOL";
       publishMQTT("wasserstand/getTargetTemperature", "0");
-    } else if (trend == "stabil") {
-      state = "OFF"; // Off
     }
     publishMQTT("wasserstand/log", json);
-    publishMQTT("wasserstand/fuellt", (trend == "einlaufend") ? "true" : "false"); // wenn trend einlaufend, dann true, für Batterie -ladend
+    publishMQTT("wasserstand/fuellt", (trend == "einlaufend") ? "true" : "false");
     publishMQTT("wasserstand/matchCoolingState", state);
   }
 }
 
+/**
+ * Führt täglichen Reboot um 02:00 Uhr aus.
+ */
 void checkDailyReboot() {
   struct tm timeinfo;
   if (getLocalTime(&timeinfo)) {
@@ -341,6 +334,9 @@ void checkDailyReboot() {
   }
 }
 
+/**
+ * Reset-Grund als String zurückgeben.
+ */
 String getResetReasonString() {
   switch (esp_reset_reason()) {
     case ESP_RST_POWERON:    return "Power-On Reset";
@@ -357,52 +353,53 @@ String getResetReasonString() {
   }
 }
 
-// ---------- SETUP ----------
+// ---------------------------------------------------------------------------
+// Setup & Loop
+// ---------------------------------------------------------------------------
+
+/**
+ * Konfigurationsdaten seriell einlesen und im Flash speichern.
+ */
 void configSetup() {
-  prefs.begin("config", false);
+  preferences.begin("config", false);
 
   Serial.println("⚙️  Neue Konfiguration eingeben:");
 
   Serial.print("WLAN SSID: ");
-  String ssid = readSerialLine();
-  prefs.putString("wifi_ssid", ssid);
+  preferences.putString("wifi_ssid", readSerialLine());
 
   Serial.print("WLAN Passwort: ");
-  String pass = readSerialLine();
-  prefs.putString("wifi_pass", pass);
+  preferences.putString("wifi_pass", readSerialLine());
 
   Serial.print("MQTT Host/IP: ");
-  String mqttHost = readSerialLine();
-  prefs.putString("mqtt_host", mqttHost);
+  preferences.putString("mqtt_host", readSerialLine());
 
   Serial.print("MQTT Benutzer (leer lassen wenn keiner): ");
-  String mqttUser = readSerialLine();
-  prefs.putString("mqtt_user", mqttUser);
+  preferences.putString("mqtt_user", readSerialLine());
 
   Serial.print("MQTT Passwort (leer lassen wenn keiner): ");
-  String mqttPass = readSerialLine();
-  prefs.putString("mqtt_pass", mqttPass);
+  preferences.putString("mqtt_pass", readSerialLine());
+
+  preferences.end();
 
   Serial.println("✅ Konfiguration gespeichert! Bitte Reset durchführen.");
-  while (true) { delay(1000); } // stoppt, bis Reset gedrückt wird
-
-  prefs.end();
+  while (true) { delay(1000); }
 }
 
 void setup() {
   Serial.begin(115200);
   delay(2000);
 
-  // Zugangsdaten WLAN und MQTT aus dem NVS abfragen
-  prefs.begin("config", false);
+  // Konfiguration laden
+  preferences.begin("config", false);
+  wifiSsid      = preferences.getString("wifi_ssid", "");
+  wifiPassword  = preferences.getString("wifi_pass", "");
+  mqttHost      = preferences.getString("mqtt_host", "");
+  mqttUsername  = preferences.getString("mqtt_user", "");
+  mqttPassword  = preferences.getString("mqtt_pass", "");
+  preferences.end();
 
-  wifiSsid = prefs.getString("wifi_ssid", "");
-  wifiPass = prefs.getString("wifi_pass", "");
-  mqttHost = prefs.getString("mqtt_host", "");
-  mqttUser = prefs.getString("mqtt_user", "");
-  mqttPass = prefs.getString("mqtt_pass", "");
-
-  if (wifiSsid == "" || wifiPass == "" || mqttHost == "") {
+  if (wifiSsid.isEmpty() || wifiPassword.isEmpty() || mqttHost.isEmpty()) {
     Serial.println("⚠️  Keine gültige Konfiguration gefunden.");
     configSetup();
   } else {
@@ -410,34 +407,29 @@ void setup() {
     Serial.printf("SSID: %s, MQTT Host: %s\n", wifiSsid.c_str(), mqttHost.c_str());
     Serial.println("👉 Tippe 'resetconfig' oder 'setconfig' um Einstellungen zu ändern.");
   }
-  prefs.end();
 
-
-  // WLAN verbinden (synchron)
-  ensureWifi();
-
-  // MQTT verbinden (synchron)
+  // WLAN & MQTT verbinden
+  ensureWifiConnected();
   connectMQTT();
 
-  // OTA & Server
+  // OTA-Setup
   ElegantOTA.onStart([]() {
     otaInProgress = true;
     logError("OTA Update gestartet – stoppe Messungen.");
   });
   ElegantOTA.onEnd([](bool success) {
     otaInProgress = false;
-    String msg = success ? "OTA erfolgreich – Neustart" : "OTA fehlgeschlagen";
-    logError(msg);
+    logError(success ? "OTA erfolgreich – Neustart" : "OTA fehlgeschlagen");
     if (success) { delay(1000); ESP.restart(); }
   });
-  ElegantOTA.begin(&server);
-  server.on("/", []() { server.sendHeader("Location", "/update"); server.send(302, ""); });
-  server.begin();
+  ElegantOTA.begin(&otaServer);
+  otaServer.on("/", []() { otaServer.sendHeader("Location", "/update"); otaServer.send(302, ""); });
+  otaServer.begin();
 
-  // NTP
+  // NTP-Setup
   configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
 
-  // ---- Letzten gespeicherten Fehler nur senden, wenn er NICHT gleich dem neuen Startgrund ist ----
+  // Letzten gespeicherten Fehler ggf. melden
   String resetMsg = "Reset-Grund: " + getResetReasonString();
   String lastErr  = readLastError();
 
@@ -452,26 +444,23 @@ void setup() {
     publishMQTT("wasserstand/lastError", lastErr);
   }
 
-  prefs.begin("errorlog", false);
-  prefs.remove("lastError");
-  prefs.end();
+  preferences.begin("errorlog", false);
+  preferences.remove("lastError");
+  preferences.end();
 
-  // Jetzt neuen Reset-Grund loggen
   logError(resetMsg);
 
-  // Initiale Messung
+  // Initialmessung
   performMeasurement(true);
   lastMeasurementTime = millis();
 }
 
-// ---------- LOOP ----------
 void loop() {
-  server.handleClient();
+  otaServer.handleClient();
 
   if (!otaInProgress) {
-    ensureWifi();
-    ensureMQTT();
-    mqttClient.loop();
+    ensureWifiConnected();
+    ensureMQTTConnected();
 
     if (millis() - lastMeasurementTime >= MEASUREMENT_INTERVAL_MS) {
       lastMeasurementTime = millis();
